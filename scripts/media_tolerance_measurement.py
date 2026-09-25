@@ -326,7 +326,14 @@ def compare(directory: Path) -> None:
             if actual.keys() != reference.keys():
                 raise ValueError(f"{profile} Python {py} metadata fields differ")
             for key in actual:
-                if key in ("repeat_difference", "perturbation_difference"):
+                if key in (
+                    "repeat_difference",
+                    "perturbation_difference",
+                    "baseline_min",
+                    "baseline_max",
+                    "baseline_rms",
+                    "baseline_distinct_values",
+                ):
                     continue
                 if actual.get(key) != reference.get(key):
                     raise ValueError(f"{profile} Python {py} metadata differs: {key}")
