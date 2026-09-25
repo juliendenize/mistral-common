@@ -1,0 +1,39 @@
+name: Temporary media tolerance measurement
+
+permissions:
+  contents: read
+
+on:
+  push:
+    branches:
+      - test/media-tolerance-measurement-20260925
+
+jobs:
+  measure:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install locked dependencies
+        run: uv sync --frozen --all-extras --group dev
+      - name: Download and verify tokenizer-only artifacts
+        run: uv run --no-sync python scripts/media_tolerance_measurement.py download --directory "$RUNNER_TEMP/verified-tokenizers"
+      - name: Measure offline public requests
+        env:
+          HF_HUB_OFFLINE: "1"
+        run: uv run --no-sync python scripts/media_tolerance_measurement.py measure --directory "$RUNNER_TEMP/verified-tokenizers" --output "$RUNNER_TEMP/media-measurement"
+      - name: Upload measured arrays and metadata
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: media-measurement-py${{ matrix.python-version }}
+          path: ${{ runner.temp }}/media-measurement/
+          if-no-files-found: warn
