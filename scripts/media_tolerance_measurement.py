@@ -217,8 +217,13 @@ def compare(directory: Path) -> None:
                     raise ValueError(f"{kind} Python {py} metadata differs: {key}")
             for label in ("baseline", "repeat", "perturbed"):
                 array = np.load(directory / f"py{py}" / f"{kind}-{label}.npy", allow_pickle=False)
-                print(f"{kind} py{py} {label} vs py3.10 baseline: {differences(baseline, array)}")
-        print(f"{kind} py3.10 baseline vs changed input: {reference['perturbation_difference']}")
+                expected = np.load(directory / "py3.10" / f"{kind}-{label}.npy", allow_pickle=False)
+                print(f"{kind} py{py} {label} vs py3.10 {label}: {differences(expected, array)}")
+            current_baseline = np.load(directory / f"py{py}" / f"{kind}-baseline.npy", allow_pickle=False)
+            repeated = np.load(directory / f"py{py}" / f"{kind}-repeat.npy", allow_pickle=False)
+            print(f"{kind} py{py} baseline vs repeat: {differences(current_baseline, repeated)}")
+        perturbed = np.load(directory / "py3.10" / f"{kind}-perturbed.npy", allow_pickle=False)
+        print(f"{kind} py3.10 baseline vs changed input: {differences(baseline, perturbed)}")
     for py, report in reports.items():
         print(f"py{py}: {report['platform']} {report['versions']}")
 
