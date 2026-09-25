@@ -11,6 +11,8 @@ on:
 jobs:
   measure:
     runs-on: ubuntu-24.04
+    env:
+      PYTHONPATH: ${{ github.workspace }}
     strategy:
       fail-fast: false
       matrix:
