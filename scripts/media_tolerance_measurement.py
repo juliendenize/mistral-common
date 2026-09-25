@@ -17,42 +17,60 @@ from huggingface_hub import hf_hub_download
 from PIL import Image
 from PIL import __version__ as pillow_version
 
-from mistral_common.protocol.instruct.chunk import ImageChunk, TextChunk
+from mistral_common.protocol.instruct.chunk import AudioChunk, ImageChunk, TextChunk
 from mistral_common.protocol.instruct.messages import UserMessage
-from mistral_common.protocol.instruct.request import ChatCompletionRequest
+from mistral_common.protocol.instruct.normalize import InstructRequestNormalizerV13
+from mistral_common.protocol.instruct.request import ChatCompletionRequest, ReasoningEffort
+from mistral_common.protocol.instruct.validator import MistralRequestValidatorV13
 from mistral_common.protocol.transcription.request import TranscriptionRequest
-from mistral_common.tokens.tokenizers.audio import Audio
-from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy, TokenizerVersion
+from mistral_common.tokens.tokenizers.audio import (
+    Audio,
+    AudioConfig,
+    AudioEncoder,
+    AudioSpectrogramConfig,
+    SpecialAudioIDs,
+)
+from mistral_common.tokens.tokenizers.base import SpecialTokenPolicy, SpecialTokens, TokenizerVersion
+from mistral_common.tokens.tokenizers.instruct import InstructTokenizerV13
 from mistral_common.tokens.tokenizers.mistral import MistralTokenizer
+from mistral_common.tokens.tokenizers.tekken import Tekkenizer
+from tests.test_tekken import get_special_tokens, quick_vocab
+from tests.test_tokenizer_v15 import get_v15_mistral_tokenizer_with_audio
 
 ARTIFACTS = {
-    "image": (
+    "v7_image": (
         "mistralai/Mistral-Small-3.1-24B-Instruct-2503",
         "68faf511d618ef198fef186659617cfd2eb8e33a",
         14801330,
         "c604f35d1035f534519622c0ec83fed6184978d4fdee92a5bd2a50bc05438094",
     ),
-    "audio": (
+    "v7_audio": (
         "mistralai/Voxtral-Mini-3B-2507",
         "3060fe34b35ba5d44202ce9ff3c097642914f8f3",
         14894206,
         "4aaf3836c2a5332f029ce85a7a62255c966f47b6797ef81dedd0ade9c862e4a8",
     ),
+    "v15_image": (
+        "mistralai/Mistral-Small-4-119B-2603",
+        "a11f36bebf709121056b1dbcc943d1c6afbe494d",
+        16275354,
+        "b1272b956bd6edd2d2c674c76896c7661308c9e723997b0afb55ecb429cb5dc7",
+    ),
 }
 
 
 def download(directory: Path) -> None:
-    r"""Fetch only two immutable tokenizer JSON files, rejecting changed bytes."""
-    for kind, (repo, revision, size, digest) in ARTIFACTS.items():
+    r"""Fetch only three immutable tokenizer JSON files, rejecting changed bytes."""
+    for profile, (repo, revision, size, digest) in ARTIFACTS.items():
         path = Path(hf_hub_download(repo_id=repo, filename="tekken.json", revision=revision))
         data = path.read_bytes()
         actual_digest = hashlib.sha256(data).hexdigest()
         if len(data) != size or actual_digest != digest:
-            raise ValueError(f"{kind} tokenizer mismatch: size={len(data)}, sha256={actual_digest}")
-        destination = directory / kind / "tekken.json"
+            raise ValueError(f"{profile} tokenizer mismatch: size={len(data)}, sha256={actual_digest}")
+        destination = directory / profile / "tekken.json"
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(data)
-        print(f"verified {kind}: {repo}@{revision} size={size} sha256={digest}")
+        print(f"verified {profile}: {repo}@{revision} size={size} sha256={digest}")
 
 
 def image_input(changed: bool) -> Image.Image:
@@ -65,21 +83,24 @@ def image_input(changed: bool) -> Image.Image:
     return Image.fromarray(pixels)
 
 
-def audio_input(changed: bool) -> Audio:
-    r"""Create two seconds of non-silent 16-kHz PCM input from fresh samples."""
-    time = np.arange(32000, dtype=np.float64) / 16000
+def audio_input(changed: bool, sampling_rate: int) -> Audio:
+    r"""Create two seconds of non-silent PCM input from fresh samples."""
+    time = np.arange(2 * sampling_rate, dtype=np.float64) / sampling_rate
     samples = 0.17 * np.sin(2 * np.pi * 220 * time) + 0.09 * np.sin(2 * np.pi * 440 * time)
     if changed:
         samples *= 0.8
-    return Audio(audio_array=samples.astype(np.float32), sampling_rate=16000, format="wav")
+    return Audio(audio_array=samples.astype(np.float32), sampling_rate=sampling_rate, format="wav")
 
 
-def encode_image(tokenizer: MistralTokenizer, changed: bool) -> tuple[np.ndarray, dict[str, Any]]:
+def encode_image(
+    tokenizer: MistralTokenizer, changed: bool, reasoning_effort: ReasoningEffort | None
+) -> tuple[np.ndarray, dict[str, Any]]:
     r"""Return the complete public chat image and its observable metadata."""
     request = ChatCompletionRequest(
         messages=[
             UserMessage(content=[TextChunk(text="Describe this pattern"), ImageChunk(image=image_input(changed))])
-        ]
+        ],
+        reasoning_effort=reasoning_effort,
     )
     result = tokenizer.encode_chat_completion(request=request)
     if len(result.images) != 1 or result.audios:
@@ -92,15 +113,19 @@ def encode_image(tokenizer: MistralTokenizer, changed: bool) -> tuple[np.ndarray
     }
 
 
-def encode_audio(tokenizer: MistralTokenizer, changed: bool) -> tuple[np.ndarray, dict[str, Any]]:
-    r"""Return the complete public transcription waveform and metadata."""
-    request = TranscriptionRequest(
-        model="measurement",
-        audio=audio_input(changed).to_base64(format="wav"),
-        language=None,
-        target_streaming_delay_ms=None,
-    )
-    result = tokenizer.encode_transcription(request=request)
+def encode_audio(
+    tokenizer: MistralTokenizer, changed: bool, sampling_rate: int, chat: bool
+) -> tuple[np.ndarray, dict[str, Any]]:
+    r"""Return the complete public transcription or chat waveform and metadata."""
+    input_audio = audio_input(changed=changed, sampling_rate=sampling_rate).to_base64(format="wav")
+    if chat:
+        chat_request = ChatCompletionRequest(messages=[UserMessage(content=[AudioChunk(input_audio=input_audio)])])
+        result = tokenizer.encode_chat_completion(request=chat_request)
+    else:
+        transcription_request = TranscriptionRequest(
+            model="measurement", audio=input_audio, language=None, target_streaming_delay_ms=None
+        )
+        result = tokenizer.encode_transcription(request=transcription_request)
     if result.images or len(result.audios) != 1:
         raise ValueError("Expected exactly one returned audio and no images")
     audio = result.audios[0]
@@ -112,6 +137,59 @@ def encode_audio(tokenizer: MistralTokenizer, changed: bool) -> tuple[np.ndarray
         "sampling_rate": audio.sampling_rate,
         "format": audio.format,
     }
+
+
+def synthetic_v13_audio() -> MistralTokenizer:
+    r"""Recreate the existing v13 audio fixture with its public validator and normalizer."""
+    tokenizer = Tekkenizer(
+        vocab=quick_vocab(extra_toks=[b"a", b"b", b"c", b"f", b"de"]),
+        special_tokens=get_special_tokens(tokenizer_version=TokenizerVersion.v13, add_think=False, add_audio=True),
+        pattern=r".+",
+        vocab_size=356,
+        num_special_tokens=100,
+        version=TokenizerVersion.v13,
+    )
+    config = AudioConfig(
+        sampling_rate=24000,
+        frame_rate=12.5,
+        encoding_config=AudioSpectrogramConfig(num_mel_bins=128, window_size=400, hop_length=160),
+    )
+    ids = SpecialAudioIDs(
+        audio=tokenizer.get_special_token(SpecialTokens.audio.value),
+        begin_audio=tokenizer.get_special_token(SpecialTokens.begin_audio.value),
+        streaming_pad=None,
+        text_to_audio=None,
+        audio_to_text=None,
+    )
+    return MistralTokenizer(
+        instruct_tokenizer=InstructTokenizerV13(
+            tokenizer=tokenizer, audio_encoder=AudioEncoder(audio_config=config, special_ids=ids)
+        ),
+        validator=MistralRequestValidatorV13(),
+        request_normalizer=InstructRequestNormalizerV13.normalizer(),
+    )
+
+
+def load_profile(profile: str, directory: Path) -> tuple[MistralTokenizer, dict[str, Any]]:
+    r"""Load a checked released or bundled file, or a clearly labeled synthetic fixture."""
+    if profile == "v13_audio_synthetic":
+        return synthetic_v13_audio(), {"source": "synthetic tests/test_tokenizer_v13.py:71-99"}
+    if profile == "v15_audio_synthetic":
+        return get_v15_mistral_tokenizer_with_audio(), {"source": "synthetic tests/test_tokenizer_v15.py:174-210"}
+    identity: dict[str, Any]
+    if profile == "v3_image":
+        path = MistralTokenizer._data_path() / "tekken_240911.json"
+        identity = {"source": "bundled tekken_240911.json at f3bb6e8"}
+    else:
+        repo, revision, size, digest = ARTIFACTS[profile]
+        path = directory / profile / "tekken.json"
+        identity = {"source": "pinned Hub tokenizer", "repo": repo, "revision": revision}
+    data = path.read_bytes()
+    actual_digest = hashlib.sha256(data).hexdigest()
+    if profile != "v3_image" and (len(data) != size or actual_digest != digest):
+        raise ValueError(f"Local {profile} tokenizer mismatch: size={len(data)}, sha256={actual_digest}")
+    identity.update({"size": len(data), "sha256": actual_digest})
+    return MistralTokenizer.from_file(tokenizer_filename=path), identity
 
 
 def differences(reference: np.ndarray, other: np.ndarray) -> dict[str, float | int]:
@@ -153,42 +231,63 @@ def measure(directory: Path, output: Path) -> None:
                 "changed": "invert R at y=50:82,x=70:102",
             },
             "audio": {
-                "input": "16000 Hz 32000 float32 samples: 0.17sin(2pi220t)+0.09sin(2pi440t); WAV PCM_16 base64",
+                "input": "2s float32 samples: 0.17sin(2pi220t)+0.09sin(2pi440t); WAV PCM_16 base64",
+                "rates": "v7 transcription 16000 or 22050 Hz; synthetic chat 22050 Hz",
                 "changed": "scale samples by 0.8",
             },
         },
     }
-    for kind, encode in (("image", encode_image), ("audio", encode_audio)):
-        repo, revision, size, digest = ARTIFACTS[kind]
-        path = directory / kind / "tekken.json"
-        data = path.read_bytes()
-        if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
-            raise ValueError(f"Local {kind} tokenizer mismatch")
-        tokenizer = MistralTokenizer.from_file(tokenizer_filename=path)
-        if tokenizer.instruct_tokenizer.tokenizer.version != TokenizerVersion.v7:
-            raise ValueError(f"{kind} tokenizer is not v7")
-        results = [encode(tokenizer, changed=changed) for changed in (False, False, True)]
+    profiles = (
+        ("v7_image", TokenizerVersion.v7),
+        ("v3_image", TokenizerVersion.v3),
+        ("v15_image", TokenizerVersion.v15),
+        ("v7_audio", TokenizerVersion.v7),
+        ("v7_audio_resampled", TokenizerVersion.v7),
+        ("v13_audio_synthetic", TokenizerVersion.v13),
+        ("v15_audio_synthetic", TokenizerVersion.v15),
+    )
+    for profile, expected_version in profiles:
+        artifact_profile = "v7_audio" if profile == "v7_audio_resampled" else profile
+        tokenizer, identity = load_profile(profile=artifact_profile, directory=directory)
+        if tokenizer.version != expected_version:
+            raise ValueError(f"{profile} unexpected tokenizer version: {tokenizer.version}")
+        if "image" in profile:
+            if tokenizer.instruct_tokenizer.image_encoder is None:
+                raise ValueError(f"{profile} lacks an image encoder")
+            effort = ReasoningEffort.high if profile == "v15_image" else None
+            results = [
+                encode_image(tokenizer=tokenizer, changed=changed, reasoning_effort=effort)
+                for changed in (False, False, True)
+            ]
+        else:
+            if tokenizer.instruct_tokenizer.audio_encoder is None:
+                raise ValueError(f"{profile} lacks an audio encoder")
+            sampling_rate = 16000 if profile == "v7_audio" else 22050
+            chat = profile in ("v13_audio_synthetic", "v15_audio_synthetic")
+            results = [
+                encode_audio(tokenizer=tokenizer, changed=changed, sampling_rate=sampling_rate, chat=chat)
+                for changed in (False, False, True)
+            ]
         baseline, baseline_metadata = results[0]
         repeated, repeated_metadata = results[1]
         perturbed, perturbed_metadata = results[2]
         if baseline_metadata != repeated_metadata:
-            raise ValueError(f"{kind} repeat metadata differs")
-        if (baseline_metadata["shape"], baseline_metadata["dtype"]) != (
-            perturbed_metadata["shape"],
-            perturbed_metadata["dtype"],
-        ):
-            raise ValueError(f"{kind} perturbation changed shape or dtype")
+            raise ValueError(f"{profile} repeat metadata differs")
+        for key in ("shape", "dtype", "sampling_rate", "format"):
+            if baseline_metadata.get(key) != perturbed_metadata.get(key):
+                raise ValueError(f"{profile} perturbation changed {key}")
         sensitivity = differences(baseline, perturbed)
         if not sensitivity["changed_elements"]:
-            raise ValueError(f"{kind} input perturbation did not change returned array")
+            raise ValueError(f"{profile} input perturbation did not change returned array")
         for label, array in (("baseline", baseline), ("repeat", repeated), ("perturbed", perturbed)):
-            np.save(output / f"{kind}-{label}.npy", array, allow_pickle=False)
-        report[kind] = {
-            "repo": repo,
-            "revision": revision,
-            "size": size,
-            "sha256": digest,
-            "mode": "test",
+            np.save(output / f"{profile}-{label}.npy", array, allow_pickle=False)
+        report[profile] = {
+            **identity,
+            "version": tokenizer.version.value,
+            "mode": tokenizer.mode.value,
+            "operation": "chat" if profile.endswith("audio_synthetic") or "image" in profile else "transcription",
+            "input_sampling_rate": None if "image" in profile else sampling_rate,
+            "reasoning_effort": "high" if profile == "v15_image" else None,
             "baseline": baseline_metadata,
             "perturbed": perturbed_metadata,
             "repeat_difference": differences(baseline, repeated),
@@ -207,23 +306,51 @@ def compare(directory: Path) -> None:
     reports: dict[str, Any] = {}
     for py in ("3.10", "3.11", "3.12", "3.13", "3.14"):
         reports[py] = json.loads((directory / f"py{py}" / "metadata.json").read_text())
-    for kind in ("image", "audio"):
-        reference = reports["3.10"][kind]
-        baseline = np.load(directory / "py3.10" / f"{kind}-baseline.npy", allow_pickle=False)
+    profiles = (
+        "v7_image",
+        "v3_image",
+        "v15_image",
+        "v7_audio",
+        "v7_audio_resampled",
+        "v13_audio_synthetic",
+        "v15_audio_synthetic",
+    )
+    for profile in profiles:
+        reference = reports["3.10"][profile]
+        max_abs = 0.0
+        max_relative = 0.0
         for py, report in reports.items():
-            actual = report[kind]
-            for key in ("repo", "revision", "size", "sha256", "mode", "baseline", "perturbed"):
-                if actual[key] != reference[key]:
-                    raise ValueError(f"{kind} Python {py} metadata differs: {key}")
+            if report["recipe"] != reports["3.10"]["recipe"]:
+                raise ValueError(f"Python {py} input recipe differs")
+            actual = report[profile]
+            if actual.keys() != reference.keys():
+                raise ValueError(f"{profile} Python {py} metadata fields differ")
+            for key in actual:
+                if key in ("repeat_difference", "perturbation_difference"):
+                    continue
+                if actual.get(key) != reference.get(key):
+                    raise ValueError(f"{profile} Python {py} metadata differs: {key}")
             for label in ("baseline", "repeat", "perturbed"):
-                array = np.load(directory / f"py{py}" / f"{kind}-{label}.npy", allow_pickle=False)
-                expected = np.load(directory / "py3.10" / f"{kind}-{label}.npy", allow_pickle=False)
-                print(f"{kind} py{py} {label} vs py3.10 {label}: {differences(expected, array)}")
-            current_baseline = np.load(directory / f"py{py}" / f"{kind}-baseline.npy", allow_pickle=False)
-            repeated = np.load(directory / f"py{py}" / f"{kind}-repeat.npy", allow_pickle=False)
-            print(f"{kind} py{py} baseline vs repeat: {differences(current_baseline, repeated)}")
-        perturbed = np.load(directory / "py3.10" / f"{kind}-perturbed.npy", allow_pickle=False)
-        print(f"{kind} py3.10 baseline vs changed input: {differences(baseline, perturbed)}")
+                array = np.load(directory / f"py{py}" / f"{profile}-{label}.npy", allow_pickle=False)
+                expected = np.load(directory / "py3.10" / f"{profile}-{label}.npy", allow_pickle=False)
+                delta = differences(reference=expected, other=array)
+                max_abs = max(max_abs, delta["max_abs"])
+                max_relative = max(max_relative, delta["max_relative_floor_1e-8"])
+                print(f"{profile} py{py} {label} vs py3.10 {label}: {delta}")
+            current_baseline = np.load(directory / f"py{py}" / f"{profile}-baseline.npy", allow_pickle=False)
+            repeated = np.load(directory / f"py{py}" / f"{profile}-repeat.npy", allow_pickle=False)
+            repeat_delta = differences(reference=current_baseline, other=repeated)
+            if repeat_delta != actual["repeat_difference"]:
+                raise ValueError(f"{profile} Python {py} repeat measurement differs from full arrays")
+            max_abs = max(max_abs, repeat_delta["max_abs"])
+            max_relative = max(max_relative, repeat_delta["max_relative_floor_1e-8"])
+            print(f"{profile} py{py} baseline vs repeat: {repeat_delta}")
+            perturbed = np.load(directory / f"py{py}" / f"{profile}-perturbed.npy", allow_pickle=False)
+            sensitivity = differences(reference=current_baseline, other=perturbed)
+            if sensitivity != actual["perturbation_difference"] or not sensitivity["changed_elements"]:
+                raise ValueError(f"{profile} Python {py} invalid input perturbation measurement")
+            print(f"{profile} py{py} baseline vs changed input: {sensitivity}")
+        print(f"{profile} maximum cross-environment/repeat absolute={max_abs} relative={max_relative}")
     for py, report in reports.items():
         print(f"py{py}: {report['platform']} {report['versions']}")
 
